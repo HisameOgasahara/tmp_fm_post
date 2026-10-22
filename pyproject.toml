@@ -1,0 +1,18 @@
+[project]
+name = "rf-post-training-lab"
+version = "0.1.0"
+description = "Rectified Flow post-training 시각화 실험"
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.6,<3",
+  "matplotlib>=3.9,<4",
+  "ipywidgets>=8.1,<9",
+  "ipython>=8,<10",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["rf_lab*"]
