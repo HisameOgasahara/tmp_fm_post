@@ -43,7 +43,11 @@ def show_explorer(experiment):
         raise RuntimeError("실험 A, B, C 중 하나를 먼저 실행하세요.")
     experiment_name = widgets.Dropdown(options=list(experiment.runs), description="실험:")
     seed = widgets.Dropdown(options=list(experiment.config.seeds), description="시드:")
-    step = widgets.SelectionSlider(description="업데이트:", continuous_update=False)
+    initial_run = experiment.runs[experiment_name.value]
+    initial_history = next(history for (s, _), history in initial_run["records"].items()
+                           if s == seed.value)
+    step = widgets.SelectionSlider(options=sorted(initial_history), value=max(initial_history),
+                                   description="업데이트:", continuous_update=False)
     time = widgets.FloatSlider(value=0.5, min=0, max=1, step=0.01,
                                 description="생성 시점:", continuous_update=False)
     view = widgets.Dropdown(options=[("벡터장", "field"), ("벡터장 변화", "delta"),
@@ -81,7 +85,6 @@ def show_explorer(experiment):
         finally:
             changing = False
 
-    set_steps()
     for control in (experiment_name, seed, step, time, view, normalize):
         control.observe(render, names="value")
     display(widgets.VBox([widgets.HBox([experiment_name, seed]), step, time,
