@@ -9,8 +9,9 @@ import torch
 
 from .config import Config
 from .core import (build_model, clone_state, collect_sde, compute_reward, estimate_score,
-                   integrate_ode, seed_all, target_center, transition_log_prob)
-from .training import make_preferences, update_direct, update_dpo, update_rl
+                   flatten_rollout, rollout_log_probs, sde_sigma, seed_all,
+                   transition_kl, transition_mean)
+from .training import group_advantages, make_preferences, update_direct, update_dpo, update_rl
 
 
 def require_colab():
@@ -57,15 +58,39 @@ def run_signal_checks():
     assert result["signal"] == 0 and not result["updated"]
     assert_same_state(original, model)
 
-    # 같은 정책으로 재계산한 가우시안 전이 확률비는 1이다.
+    # 같은 정책으로 한 번에 재계산한 가우시안 전이 확률비는 1이다.
     noise = torch.randn(config.batch_size, 2)
     rollout = collect_sde(model, noise, config)
-    log_probs = torch.stack([transition_log_prob(model, rollout["states"][i],
-        rollout["states"][i + 1], t, rollout["dt"], config.sde_noise)
-        for i, t in enumerate(rollout["times"])])
-    assert torch.allclose((log_probs - rollout["log_probs"]).exp(), torch.ones_like(log_probs), atol=1e-6)
+    log_probs, velocity = rollout_log_probs(model, rollout, config)
+    assert torch.allclose((log_probs - rollout["log_probs"]).exp(), torch.ones_like(log_probs), atol=1e-5)
     repeated = collect_sde(model, noise, config, rollout["step_noise"])
     assert torch.equal(rollout["path"], repeated["path"])
+
+    # Flow-GRPO σ(t): 잡음 쪽에서 크고 데이터 쪽에서 작다. 같은 모델의 전이 KL은 0이다.
+    assert sde_sigma(0.1, config) > sde_sigma(0.9, config) > 0
+    x, _, t, sigma, _ = flatten_rollout(rollout, config)
+    assert torch.allclose(transition_kl(velocity, velocity.detach(), x, t, sigma, rollout["dt"]),
+                          torch.zeros(len(x)), atol=1e-10)
+    # 닫힌형 KL은 평균 차이로 계산한 가우시안 KL과 같다.
+    shifted = velocity.detach() + 0.1
+    mean_a = transition_mean(model, x, t, rollout["dt"], sigma, velocity=velocity.detach())
+    mean_b = transition_mean(model, x, t, rollout["dt"], sigma, velocity=shifted)
+    direct_kl = (mean_a - mean_b).square().sum(-1) / (2 * sigma.squeeze(-1) ** 2 * rollout["dt"])
+    assert torch.allclose(transition_kl(velocity.detach(), shifted, x, t, sigma, rollout["dt"]),
+                          direct_kl, rtol=1e-4)
+
+    # 그룹 advantage는 평균 0, 표준편차 1이며 보상이 모두 같으면 0이다.
+    advantages = group_advantages(torch.arange(8).float(), config)
+    assert abs(float(advantages.mean())) < 1e-6 and abs(float(advantages.std(unbiased=False)) - 1) < 1e-5
+    assert not torch.any(group_advantages(torch.ones(8), config))
+
+    # KL을 켠 RL 업데이트는 현재 모델만 바꾸고 기준 모델은 고정한다.
+    rl_config = replace(config, regularization={**config.regularization, "RL": 0.1})
+    rl_model = deepcopy(reference).requires_grad_(True)
+    rl_optimizer = torch.optim.Adam(rl_model.parameters(), lr=config.learning_rates["RL"])
+    result = update_rl(rl_model, reference, rl_optimizer, rl_config, "smooth")
+    assert result["updated"] and result["kl"] >= 0
+    assert_same_state(original, reference)
 
     # 데이터도 표준 정규분포이면 RF 경로의 분산은 (1-t)^2+t^2이다.
     class GaussianVelocity(torch.nn.Module):
@@ -88,7 +113,8 @@ def run_signal_checks():
     assert result["updated"] and torch.isfinite(result["detail"]["logits"]).all()
     assert_same_state(original, reference)
     assert any(not torch.equal(original[key], value.cpu()) for key, value in model.state_dict().items())
-    print("학습 신호 확인 통과: 기울기 접근, 무신호 건너뛰기, 선호 순서, SDE 확률비·난수 고정, score, 기준 모델 고정")
+    print("학습 신호 확인 통과: 기울기 접근, 무신호 건너뛰기, 선호 순서, SDE 확률비·난수 고정, "
+          "σ(t)·전이 KL, 그룹 advantage, score, 기준 모델 고정")
 
 
 def run_integration_check():

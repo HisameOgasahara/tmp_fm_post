@@ -2,8 +2,8 @@ from copy import deepcopy
 import torch
 import torch.nn.functional as F
 
-from .core import (collect_sde, compute_reward, integrate_ode, sample_data,
-                   target_center, transition_log_prob)
+from .core import (collect_sde, compute_reward, flatten_rollout, integrate_ode,
+                   rollout_log_probs, sample_data, target_center, transition_kl)
 
 
 def pretrain_model(model, config, progress=None):
@@ -74,6 +74,10 @@ def apply_step(model, optimizer, loss, config):
 
 
 def reference_penalty(model, reference, config):
+    """Direct·DPO용 기준 모델 고정 항: 데이터 보간점에서 기준 모델 속도와의 MSE.
+
+    RL은 이 항 대신 수집 경로 위의 닫힌형 전이 KL(transition_kl)을 사용한다.
+    """
     device = next(model.parameters()).device
     x = sample_data(config, config.batch_size, device)
     z = torch.randn_like(x)
@@ -84,33 +88,49 @@ def reference_penalty(model, reference, config):
     return F.mse_loss(model(middle, t), target)
 
 
+def group_advantages(rewards, config):
+    """GRPO식 그룹 상대 advantage. 무조건 생성이므로 배치 전체가 하나의 그룹이다."""
+    centered = rewards - rewards.mean()
+    if config.advantage_normalization == "mean":
+        return centered
+    std = rewards.std(unbiased=False)
+    return centered / std if std > 1e-12 else torch.zeros_like(rewards)
+
+
 def update_rl(model, reference, optimizer, config, reward_kind, capture=False):
+    """Flow-GRPO: SDE 수집 → 그룹 정규화 advantage → 단계별 PPO-clip + 전이 KL."""
     device = next(model.parameters()).device
     old_model = deepcopy(model).requires_grad_(False)
     noise = torch.randn(config.batch_size, 2, device=device)
     rollout = collect_sde(old_model, noise, config)
     rewards = compute_reward(rollout["endpoint"], config, reward_kind)
-    advantages = rewards - rewards.mean()
+    centered = rewards - rewards.mean()
+    advantages = group_advantages(rewards, config)
     info = {"reward_evaluations": len(rewards), "success_samples": int(
         compute_reward(rollout["endpoint"], config, "binary").sum().item()),
-        "signal": float(advantages.abs().mean()), "valid_pairs": 0,
-        "updated": False, "loss": 0.0,
+        "signal": float(centered.abs().mean()), "valid_pairs": 0,
+        "updated": False, "loss": 0.0, "kl": 0.0,
         "status": "점수 차이 없음" if not torch.any(advantages) else "점수 차이 사용 가능"}
     if torch.any(advantages):
+        beta_kl = config.regularization["RL"]
+        x, _, t, sigma, _ = flatten_rollout(rollout, config)
+        if beta_kl:
+            with torch.no_grad():
+                v_ref = reference(x, t)
         for _ in range(config.ppo_epochs):
-            log_probs = torch.stack([
-                transition_log_prob(model, rollout["states"][i], rollout["states"][i + 1],
-                                    t, rollout["dt"], config.sde_noise)
-                for i, t in enumerate(rollout["times"])])
+            log_probs, v = rollout_log_probs(model, rollout, config)
             ratios = (log_probs - rollout["log_probs"]).exp()
             clipped = ratios.clamp(1 - config.ppo_clip, 1 + config.ppo_clip)
             loss = -torch.minimum(ratios * advantages, clipped * advantages).mean()
-            if config.regularization["RL"]:
-                loss = loss + config.regularization["RL"] * reference_penalty(model, reference, config)
+            if beta_kl:
+                kl = transition_kl(v, v_ref, x, t, sigma, rollout["dt"]).mean()
+                loss = loss + beta_kl * kl
+                info["kl"] = kl.item()
             apply_step(model, optimizer, loss, config)
             info.update(updated=True, loss=loss.item())
     if capture:
-        info["detail"] = {**rollout, "rewards": rewards, "advantages": advantages}
+        info["detail"] = {**rollout, "rewards": rewards, "centered_rewards": centered,
+                          "advantages": advantages}
     return info
 
 
@@ -157,11 +177,17 @@ def update_direct(model, reference, optimizer, config, reward_kind,
 
 
 def compute_pair_errors(model, winner, loser, t, noise):
+    """winner/loser가 같은 t·noise를 공유하는 flow-matching 제곱 오차(차원 합)."""
     middle_w = (1 - t) * noise + t * winner
     middle_l = (1 - t) * noise + t * loser
-    error_w = (model(middle_w, t) - (winner - noise)).square().mean(-1)
-    error_l = (model(middle_l, t) - (loser - noise)).square().mean(-1)
+    error_w = (model(middle_w, t) - (winner - noise)).square().sum(-1)
+    error_l = (model(middle_l, t) - (loser - noise)).square().sum(-1)
     return error_w, error_l, middle_w, middle_l
+
+
+def dpo_scale(config):
+    """Diffusion-DPO의 β·T. T는 생성 단계 수이며 ω(λ)=1로 둔다."""
+    return config.dpo_beta * (config.dpo_timesteps or config.steps)
 
 
 def update_dpo(model, reference, optimizer, config, dataset, capture=False):
@@ -178,7 +204,7 @@ def update_dpo(model, reference, optimizer, config, dataset, capture=False):
     ew, el, mw, ml = compute_pair_errors(model, winner, loser, t, noise)
     with torch.no_grad():
         rw, rl, _, _ = compute_pair_errors(reference, winner, loser, t, noise)
-    logits = -config.dpo_beta * ((ew - el) - (rw - rl))
+    logits = -dpo_scale(config) * ((ew - rw) - (el - rl))
     loss = -F.logsigmoid(logits).mean()
     if config.regularization["DPO"]:
         loss = loss + config.regularization["DPO"] * reference_penalty(model, reference, config)

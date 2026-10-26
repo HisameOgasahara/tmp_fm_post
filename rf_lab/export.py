@@ -2,8 +2,8 @@ import json
 import shutil
 import matplotlib.pyplot as plt
 
-from .plots import (export_animations, plot_distributions, plot_fields,
-                    plot_learning_curves, plot_one_update, plot_paths, plot_update_details)
+from .plots import (export_animations, plot_distributions, plot_fields, plot_learning_curves,
+                    plot_one_update, plot_paths, plot_sweep, plot_update_details)
 
 
 def build_report(experiment):
@@ -25,9 +25,12 @@ def build_report(experiment):
              "## 실험별 관찰", ""]
     for name, run in experiment.runs.items():
         methods = sorted({row["method"] for row in run["rows"]})
+        sweep = run.get("tag") == "sweep"
+        changed = ", ".join(f"{key}={value}" for key, value in run.get("overrides", {}).items())
         lines.extend([f"### {name}", "",
                       f"보상: `{run['reward_kind']}`, 기울기 접근: `{run['gradient_access']}`, "
-                      f"목표 반경: {run['config'].target_radius:g}.", "",
+                      f"목표 반경: {run['config'].target_radius:g}."
+                      + (f" 변경 설정: `{changed}`." if changed else ""), "",
                       "| 기법 | 평균 보상 전→후 | 도달률 전→후 | 군집 밖 비율 | 학습용 평가 수 | 학습 시간(초) | 최대 GPU MB |",
                       "| --- | --- | --- | --- | --- | --- | --- |"])
         for method in methods:
@@ -40,25 +43,31 @@ def build_report(experiment):
                          f"{mean(initial, 'success_rate'):.1%} → {mean(final, 'success_rate'):.1%} | "
                          f"{mean(final, 'outside_rate'):.1%} | {mean(final, 'reward_evaluations'):.0f} | "
                          f"{mean(final, 'training_seconds'):.2f} | {max(r['peak_gpu_mb'] for r in final):.1f} |")
+        if sweep:
+            lines.extend(["", f"![도착점 분포](figures/{name}/distributions.png)", ""])
+            continue
         lines.extend(["", f"![벡터장](figures/{name}/vector_fields.png)",
                       f"![벡터장 변화](figures/{name}/vector_field_changes.png)",
                       f"![생성 경로](figures/{name}/trajectories.png)",
                       f"![도착점 분포](figures/{name}/distributions.png)", "",
                       "벡터장 변화 그림은 같은 위치·생성 시점의 속도 차이를 나타낸다. "
                       "생성 경로와 도착점은 같은 초기 잡음으로 비교한다.", ""])
+    if experiment.sweeps:
+        lines.extend(["## 설정 스윕", ""])
+        for group, sweep in experiment.sweeps.items():
+            lines.extend([f"### {group}", "", f"기법: {sweep['method']}, 변경: `{sweep['field']}`", "",
+                          f"![{group}](figures/sweeps/{group}.png)", ""])
     lines.extend(["## 비용 해석", "", "![성능과 비용](figures/learning_curves.png)", "",
                   "학습 시간에는 결과 수집·학습 업데이트와 DPO 선호 자료 준비 시간을 포함한다. "
                   "공통 사전학습, 평가, 그림 생성, 파일 저장은 분리한다. "
                   "DPO 후보 평가는 최초 한 번만 계상하며, 재사용한 기록에 대한 추가 학습용 평가는 0이다. "
                   "평가 수가 고정된 DPO 곡선은 같은 가로축 위치에서 세로로 변할 수 있다. "
                   "얇은 선은 시드별 결과이며 굵은 선은 같은 업데이트 횟수에서 비용과 성능을 각각 평균한 값이다.", "",
-                  "## 해석 범위", "",
-                  "DPO는 RF 예측 오차 차이에 적용한 선호 목적함수이다. "
-                  "정확한 ODE 우도 기반 DPO와 동일하다고 해석하지 않는다. "
-                  "RL은 시간 내부의 가우시안 SDE 전이 확률을 사용하며, 양 끝 ODE 연결은 "
-                  "수집 당시 모델로 고정된 것으로 다룬다. 근사적인 끝단 처리이므로 epsilon과 잡음 크기의 영향을 확인한다. "
-                  "RL의 학습 경로는 SDE이고 공통 성능 평가는 ODE이므로 두 결과는 다를 수 있다. "
-                  "큰 보상만으로 원래 분포 보존을 보장할 수 없으며, 군집 밖 비율과 군집별 비율을 함께 확인한다.", ""])
+                  "## 기법 정의", "",
+                  "- RL: Flow-GRPO. 배치 전체를 한 그룹으로 표준화한 advantage, 단계별 PPO-clip, "
+                  "수집 경로 위의 닫힌형 전이 KL(`regularization['RL']`). 학습 경로는 SDE, 공통 평가는 ODE이다.",
+                  "- Direct: DRaFT 전체 역전파. 32단계 ODE 전체로 보상 기울기를 전달한다.",
+                  "- DPO: Diffusion-DPO를 flow-matching 오차에 적용. logit 스케일은 `dpo_beta × T`이다.", ""])
     return "\n".join(lines)
 
 
@@ -69,25 +78,33 @@ def export_all(experiment, animate=True, progress=print):
     first_name = next(iter(experiment.runs))
     for name in experiment.runs:
         directory = experiment.output / "figures" / name
-        for filename, function, options in (
-            ("vector_fields.png", plot_fields, {}),
-            ("vector_field_changes.png", plot_fields, {"delta": True}),
-            ("vector_field_directions.png", plot_fields, {"delta": True, "normalize": True}),
-            ("trajectories.png", plot_paths, {}),
-            ("distributions.png", plot_distributions, {})):
+        figures = (("vector_fields.png", plot_fields, {}),
+                   ("vector_field_changes.png", plot_fields, {"delta": True}),
+                   ("vector_field_directions.png", plot_fields, {"delta": True, "normalize": True}),
+                   ("trajectories.png", plot_paths, {}),
+                   ("distributions.png", plot_distributions, {}))
+        if experiment.runs[name].get("tag") == "sweep":
+            figures = figures[-1:]
+        for filename, function, options in figures:
             fig = function(experiment, name, path=directory / filename, **options)
             plt.close(fig)
             if name == first_name:
                 shutil.copy2(directory / filename, experiment.output / "figures" / filename)
-        if animate:
+        if animate and experiment.runs[name].get("tag") != "sweep":
             outputs = export_animations(experiment, name, experiment.output / "animations" / name)
             if name == first_name:
                 for output in outputs:
                     shutil.copy2(output, experiment.output / "animations" / output.name)
         if progress:
             progress(f"{name}: 그림과 애니메이션 저장 완료" if animate else f"{name}: 그림 저장 완료")
-    fig = plot_learning_curves(experiment, path=experiment.output / "figures" / "learning_curves.png")
+    main_runs = [name for name, run in experiment.runs.items() if run.get("tag") != "sweep"]
+    fig = plot_learning_curves(experiment, main_runs or None,
+                               path=experiment.output / "figures" / "learning_curves.png")
     plt.close(fig)
+    for group, sweep in experiment.sweeps.items():
+        fig = plot_sweep(experiment, sweep["method"], sweep["field"], sweep["points"],
+                         path=experiment.output / "figures" / "sweeps" / f"{group}.png")
+        plt.close(fig)
     for index, (key, result) in enumerate(experiment.one_updates.items()):
         for filename, function in (("one_update.png", plot_one_update), ("one_update_details.png", plot_update_details)):
             output = experiment.output / "figures" / key / filename

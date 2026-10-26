@@ -206,6 +206,28 @@ def plot_learning_curves(experiment, names=None, path=None):
     return save_figure(fig, path)
 
 
+def final_rows(run, method):
+    return [row for row in run["rows"] if row["method"] == method and row["step"] == run["config"].updates]
+
+
+def plot_sweep(experiment, method, label, points, path=None):
+    """points: [(설정값, 실험 이름)]. 최종 보상·도달률·군집 밖 비율을 설정값에 대해 그린다."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True, dpi=experiment.config.plot_dpi)
+    points = sorted(points)
+    positions = range(len(points))
+    for ax, key in zip(axes, ("mean_reward", "success_rate", "outside_rate")):
+        means = []
+        for position, (_, name) in zip(positions, points):
+            ys = [row[key] for row in final_rows(experiment.runs[name], method)]
+            ax.scatter([position] * len(ys), ys, alpha=0.35, color=METHOD_COLORS[method])
+            means.append(sum(ys) / len(ys))
+        ax.plot(list(positions), means, marker="o", linewidth=2, color=METHOD_COLORS[method])
+        ax.set_xticks(list(positions), [f"{value:g}" for value, _ in points])
+        ax.set(xlabel=label, ylabel=key, ylim=(-0.02, 1.02), title=f"{method}: final {key}")
+        ax.grid(alpha=0.2)
+    return save_figure(fig, path)
+
+
 @torch.no_grad()
 def plot_one_update(experiment, result, path=None):
     config = result["config"]
@@ -227,7 +249,7 @@ def plot_one_update(experiment, result, path=None):
         if method == "RL":
             rewards, advantages = as_array(detail["rewards"]), as_array(detail["advantages"])
             ax.plot(rewards, label="terminal reward")
-            ax.plot(advantages, label="reward - batch mean")
+            ax.plot(advantages, label="group advantage")
             ax.axhline(0, color="gray", linewidth=0.5)
             ax.legend(fontsize=8)
             ax.set(xlabel="Collected sample", title="RL: terminal feedback")
@@ -299,7 +321,7 @@ def plot_update_details(result, path=None):
         for key in ("error_w", "error_l", "ref_error_w", "ref_error_l"):
             axes[2].plot(as_array(detail[key]), label=key, alpha=0.7)
         axes[2].legend(fontsize=8)
-    axes[2].set(xlabel="Pair in update batch", ylabel="Flow matching MSE", title="DPO: current / reference errors")
+    axes[2].set(xlabel="Pair in update batch", ylabel="Flow matching squared error", title="DPO: current / reference errors")
     return save_figure(fig, path)
 
 

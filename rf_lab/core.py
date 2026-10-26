@@ -80,15 +80,65 @@ def estimate_score(model, x, t):
     return (t * model(x, t) - x) / (1 - t)
 
 
-def transition_mean(model, x, t, dt, noise_scale):
-    v = model(x, t)
+def sde_sigma(t, config):
+    """SDE 확산 계수 σ(t).
+
+    flow_grpo: Flow-GRPO의 g(s)^2 = a^2 s/(1-s)를 잡음 수준 s = 1 - t로 옮긴
+    σ(t) = a·sqrt((1-t)/t). 잡음 쪽(t→0)에서 크고 데이터 쪽(t→1)에서 0으로 줄어든다.
+    constant: σ(t) = a.
+    """
+    if config.sde_noise_schedule == "constant":
+        return torch.full_like(t, config.sde_noise) if torch.is_tensor(t) else config.sde_noise
+    if torch.is_tensor(t):
+        return config.sde_noise * torch.sqrt((1 - t) / t)
+    return config.sde_noise * math.sqrt((1 - t) / t)
+
+
+def transition_mean(model, x, t, dt, sigma, velocity=None):
+    """dx = [v + σ²/2·score] dt + σ dW 의 Euler–Maruyama 평균. ODE와 같은 주변분포를 갖는다."""
+    v = model(x, t) if velocity is None else velocity
     score = (t * v - x) / (1 - t)
-    return x + (v + 0.5 * noise_scale ** 2 * score) * dt
+    return x + (v + 0.5 * sigma ** 2 * score) * dt
 
 
-def transition_log_prob(model, x, next_x, t, dt, noise_scale):
-    mean = transition_mean(model, x, t, dt, noise_scale)
-    return torch.distributions.Normal(mean, noise_scale * math.sqrt(dt)).log_prob(next_x).sum(-1)
+def gaussian_log_prob(next_x, mean, std):
+    return (-(next_x - mean).square() / (2 * std ** 2) - torch.log(std)
+            - 0.5 * math.log(2 * math.pi)).sum(-1)
+
+
+def transition_log_prob(model, x, next_x, t, dt, sigma):
+    mean = transition_mean(model, x, t, dt, sigma)
+    std = torch.as_tensor(sigma * math.sqrt(dt), device=x.device, dtype=x.dtype)
+    return gaussian_log_prob(next_x, mean, std.expand_as(mean))
+
+
+def flatten_rollout(rollout, config):
+    """수집 경로의 모든 내부 전이를 (단계×샘플) 한 배치로 펼친다."""
+    states = rollout["states"]
+    steps, batch = states.shape[0] - 1, states.shape[1]
+    x = states[:-1].reshape(-1, 2)
+    next_x = states[1:].reshape(-1, 2)
+    t = torch.tensor(rollout["times"], device=x.device, dtype=x.dtype)
+    t = t[:, None].expand(steps, batch).reshape(-1, 1)
+    return x, next_x, t, sde_sigma(t, config), (steps, batch)
+
+
+def rollout_log_probs(model, rollout, config, velocity=None):
+    """모든 단계의 전이 log-prob을 한 번의 모델 호출로 계산한다. 반환 형태 (단계, 샘플)."""
+    x, next_x, t, sigma, shape = flatten_rollout(rollout, config)
+    v = model(x, t) if velocity is None else velocity
+    mean = transition_mean(model, x, t, rollout["dt"], sigma, velocity=v)
+    std = (sigma * math.sqrt(rollout["dt"])).expand_as(mean)
+    return gaussian_log_prob(next_x, mean, std).reshape(shape), v
+
+
+def transition_kl(v, v_ref, x, t, sigma, dt):
+    """같은 분산의 두 가우시안 전이 사이 닫힌형 KL = ||μθ - μref||² / (2σ²dt).
+
+    μθ - μref = (vθ - vref)(1 + σ²t / (2(1-t))) dt 이므로 속도 차이만으로 계산된다.
+    """
+    factor = 1 + sigma ** 2 * t / (2 * (1 - t))
+    return (dt / 2) * (factor / sigma).square().squeeze(-1) * (v - v_ref).square().sum(-1)
 
 
 @torch.no_grad()
@@ -102,9 +152,10 @@ def collect_sde(model, noise, config, step_noise=None):
     if step_noise is None:
         step_noise = torch.randn(config.steps, *noise.shape, device=noise.device)
     for i, t in enumerate(times):
-        next_x = transition_mean(model, x, t, dt, config.sde_noise)
-        next_x = next_x + config.sde_noise * math.sqrt(dt) * step_noise[i]
-        log_probs.append(transition_log_prob(model, x, next_x, t, dt, config.sde_noise))
+        sigma = sde_sigma(t, config)
+        next_x = transition_mean(model, x, t, dt, sigma)
+        next_x = next_x + sigma * math.sqrt(dt) * step_noise[i]
+        log_probs.append(transition_log_prob(model, x, next_x, t, dt, sigma))
         x = next_x
         states.append(x)
     endpoint = x + eps * model(x, 1 - eps)

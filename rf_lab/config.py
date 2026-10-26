@@ -41,9 +41,12 @@ class Config:
     grad_clip: float = 1.0
     ppo_epochs: int = 4
     ppo_clip: float = 0.2
+    advantage_normalization: str = "std"
     sde_epsilon: float = 0.02
-    sde_noise: float = 0.3
+    sde_noise_schedule: str = "flow_grpo"
+    sde_noise: float = 0.7
     dpo_beta: float = 2.0
+    dpo_timesteps: int | None = None
     candidate_count: int = 4096
     preference_pairs: int = 2048
     preference_tie_tolerance: float = 0.0
@@ -64,6 +67,12 @@ class Config:
             raise ValueError("grid_size >= 2 and unique nonempty seeds required")
         if not 0 < self.sde_epsilon < 0.5 or self.sde_noise <= 0:
             raise ValueError("SDE requires 0 < epsilon < 0.5 and positive noise")
+        if self.sde_noise_schedule not in ("flow_grpo", "constant"):
+            raise ValueError("sde_noise_schedule must be 'flow_grpo' or 'constant'")
+        if self.advantage_normalization not in ("std", "mean"):
+            raise ValueError("advantage_normalization must be 'std' or 'mean'")
+        if self.dpo_beta <= 0 or (self.dpo_timesteps is not None and self.dpo_timesteps <= 0):
+            raise ValueError("dpo_beta and dpo_timesteps must be positive")
         if min(self.target_radius, self.reward_width, self.cluster_std) <= 0:
             raise ValueError("Radii, width and standard deviation must be positive")
         if self.updates < 0 or self.pretrain_updates < 0:

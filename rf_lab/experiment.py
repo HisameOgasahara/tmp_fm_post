@@ -39,6 +39,7 @@ class Experiment:
             (self.output / folder).mkdir()
         self.baselines, self.eval_noise, self.runs, self.preferences = {}, {}, {}, {}
         self.one_updates = {}
+        self.sweeps = {}
         self.pretraining = {}
         self.save_config()
         print(f"실행 장치: {self.device} | 결과: {self.output}")
@@ -54,7 +55,8 @@ class Experiment:
                    "versions": versions, "ode_solver": "Euler, t=0..1",
                    "sde_endpoints": "ODE 0->epsilon, SDE epsilon->1-epsilon, ODE ->1",
                    "rl_endpoint_gradient": "endpoint ODE frozen during each PPO update",
-                   "dpo_objective": "unweighted flow-matching error preference surrogate"}
+                   "rl_objective": "Flow-GRPO: group advantage, per-step PPO-clip, closed-form transition KL",
+                   "dpo_objective": "Diffusion-DPO on flow-matching errors, logit scale beta*T, omega=1"}
         (self.output / "results" / "config.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -128,12 +130,17 @@ class Experiment:
         return metrics
 
     def run(self, name, reward_kind="smooth", gradient_access=True,
-            preference_name=None, coverage=None, target_radius=None, progress=print):
+            preference_name=None, coverage=None, target_radius=None, progress=print,
+            methods=None, overrides=None, tag=None):
+        """overrides: Config 필드 덮어쓰기. dict 필드(learning_rates 등)는 기존 값에 병합한다."""
         self.require_baseline()
         if name in self.runs:
             raise ValueError(f"실험 이름이 이미 있습니다: {name}. 새 이름을 사용하세요.")
-        config = replace(self.config, target_radius=self.config.target_radius
-                         if target_radius is None else target_radius).validate()
+        changes = {} if target_radius is None else {"target_radius": target_radius}
+        for key, value in (overrides or {}).items():
+            base = getattr(self.config, key)
+            changes[key] = {**base, **value} if isinstance(base, dict) else value
+        config = replace(self.config, **changes).validate()
         if coverage is not None and preference_name is None:
             raise ValueError("실험 C는 먼저 저장한 선호 기록이 필요합니다.")
         if preference_name is None:
@@ -142,9 +149,11 @@ class Experiment:
         preferences = self.preferences[preference_name]
         if preferences["reward_kind"] != reward_kind or preferences["config"].to_dict() != config.to_dict():
             raise ValueError("선호 기록과 실행 설정이 일치하지 않습니다.")
-        methods = ("DPO",) if coverage is not None else ("RL", "Direct", "DPO")
+        if methods is None:
+            methods = ("DPO",) if coverage is not None else ("RL", "Direct", "DPO")
         run = {"name": name, "reward_kind": reward_kind, "gradient_access": gradient_access,
-               "config": deepcopy(config), "coverage": coverage,
+               "config": deepcopy(config), "coverage": coverage, "tag": tag,
+               "overrides": changes,
                "preference_name": preference_name, "records": {}, "rows": []}
         self.runs[name] = run
         for seed in config.seeds:
@@ -162,7 +171,8 @@ class Experiment:
                 peak_memory = record["peak_gpu_bytes"] if method == "DPO" else 0
                 eval_seconds, eval_results = 0.0, 0
                 info = {"signal": 0.0, "valid_pairs": 0 if dataset is None else len(dataset["winner"]),
-                        "success_samples": 0, "updated": False, "loss": 0.0, "status": "학습 전"}
+                        "success_samples": 0, "updated": False, "loss": 0.0, "kl": 0.0,
+                        "status": "학습 전"}
                 for step in range(config.updates + 1):
                     if step:
                         self.synchronize()
@@ -187,8 +197,8 @@ class Experiment:
                                **metrics, "training_seconds": elapsed, "reward_evaluations": evaluations,
                                "evaluation_seconds": eval_seconds, "evaluation_reward_results": eval_results,
                                "peak_gpu_mb": peak_memory / 1024 ** 2,
-                               **{key: info[key] for key in ("signal", "valid_pairs", "success_samples",
-                                                           "updated", "loss", "status")}}
+                               **{key: info.get(key, 0.0) for key in ("signal", "valid_pairs",
+                                  "success_samples", "updated", "loss", "kl", "status")}}
                         run["rows"].append(row)
                         torch.save(history[step], self.output / "checkpoints" /
                                    f"{name}_{method}_seed{seed}_step{step}.pt")
@@ -197,6 +207,29 @@ class Experiment:
                                      f"보상={metrics['mean_reward']:.3f}, 도달률={metrics['success_rate']:.1%}")
         self.save_metrics()
         return run
+
+    def run_sweep(self, group, method, field, values, baseline=None, reward_kind="smooth",
+                  progress=print):
+        """한 기법의 설정 하나를 바꿔 가며 같은 사전학습 상태에서 반복 실행한다.
+
+        field가 learning_rates·regularization이면 해당 기법 항목만 바꾼다.
+        baseline=(값, 기존 실험 이름)을 주면 그 실험의 같은 기법 결과를 비교점으로 포함한다.
+        """
+        points = [] if baseline is None else [baseline]
+        for value in values:
+            override = {field: {method: value}} if field in ("learning_rates", "regularization") else {field: value}
+            name = f"S_{group}_{value:g}"
+            self.run(name, reward_kind=reward_kind, methods=(method,), overrides=override,
+                     tag="sweep", progress=None)
+            points.append((value, name))
+            if progress:
+                rows = [row for row in self.runs[name]["rows"] if row["step"] == self.config.updates]
+                mean = lambda key: sum(row[key] for row in rows) / len(rows)
+                progress(f"{group} {field}={value:g}: 보상={mean('mean_reward'):.3f}, "
+                         f"도달률={mean('success_rate'):.1%}, 군집 밖={mean('outside_rate'):.1%}, "
+                         f"학습 시간={mean('training_seconds'):.1f}s")
+        self.sweeps[group] = {"method": method, "field": field, "points": points}
+        return points
 
     def compare_one_update(self, reward_kind="smooth", gradient_access=True, target_radius=None):
         self.require_baseline()
@@ -236,6 +269,7 @@ class Experiment:
                 writer.writerows(rows)
         settings = {name: {"config": run["config"].to_dict(), "reward_kind": run["reward_kind"],
                            "gradient_access": run["gradient_access"], "coverage": run["coverage"],
-                           "preference_name": run["preference_name"]} for name, run in self.runs.items()}
+                           "preference_name": run["preference_name"], "tag": run.get("tag"),
+                           "overrides": run.get("overrides", {})} for name, run in self.runs.items()}
         (self.output / "results" / "runs.json").write_text(
             json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
